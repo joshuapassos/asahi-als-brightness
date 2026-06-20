@@ -2,7 +2,7 @@
 
 Automatic display brightness based on the ambient light sensor (ALS) for Apple Silicon laptops running [Asahi Linux](https://asahilinux.org/).
 
-Works with the **VD6286** ALS sensor found in M2 MacBook Air (13" and 15") and other Apple Silicon laptops, driven by the `aop_als` kernel module from the [Asahi fairydust](https://github.com/AsahiLinux/linux/tree/fairydust) kernel.
+Works with the **VD6286** ALS sensor found across Apple Silicon laptops (M1 Pro/Max MacBook Pro, M2 MacBook Air, and others), driven by the `aop_als` kernel module from the [Asahi fairydust](https://github.com/AsahiLinux/linux/tree/fairydust) kernel.
 
 > ### Credits / based on
 > This project is a **desktop-agnostic fork of [juicecultus/asahi-auto-brightness](https://github.com/juicecultus/asahi-auto-brightness)** (original work © juicecultus — see [`LICENSE`](LICENSE)).
@@ -153,7 +153,8 @@ Values are linearly interpolated between points.
 
 ## Tested Hardware
 
-- MacBook Air 15" M2 (J415) — VD6286 sensor, Asahi Fedora 42 (backlight scale 0–500)
+- MacBook Pro 16" M1 Max (`apple,j316c` / `t6001`) — VD6286 ALS, Asahi Fedora, niri, backlight scale 0–500
+- MacBook Air 15" M2 (J415) — original upstream testing ([juicecultus/asahi-auto-brightness](https://github.com/juicecultus/asahi-auto-brightness))
 
 ## Troubleshooting
 
