@@ -1,0 +1,371 @@
+#!/usr/bin/env python3
+"""
+auto-brightness — Ambient Light Sensor auto-brightness for Asahi Linux
+
+Desktop-agnostic: controls display brightness directly through the Linux
+backlight subsystem, with no dependency on KDE/PowerDevil. Works under any
+Wayland compositor (niri, sway, Hyprland, …), KDE, GNOME, or a bare TTY.
+
+Architecture:
+  - Reads lux directly from the IIO sensor sysfs node (low latency,
+    no iio-sensor-proxy dependency)
+  - Sets brightness via the kernel backlight sysfs node. Two backends,
+    auto-selected at startup:
+      1. Direct sysfs write — if /sys/class/backlight/<dev>/brightness is
+         writable (e.g. via the bundled 99-backlight.rules udev rule)
+      2. systemd-logind D-Bus (org.freedesktop.login1 SetBrightness) —
+         no root and no udev rule needed; logind performs the privileged
+         write on behalf of the active session
+  - One brightness step per poll cycle: imperceptible transitions
+  - Manual override: respects brightness changes made elsewhere (e.g.
+    compositor brightness keys / brightnessctl) until ambient light shifts
+    by ≥LUX_CHANGE_PCT (or ≥LUX_CHANGE_MIN lux absolute in low light)
+
+Designed for Apple Silicon laptops running Asahi Linux with the VD6286
+ALS sensor driven by the aop_als kernel module.
+
+Usage:
+  auto-brightness                              # run in foreground
+  systemctl --user start auto-brightness       # via systemd
+
+Requires:
+  - Kernel with aop_als module (IIO ALS sensor)
+  - Either a writable backlight sysfs node (see 99-backlight.rules) OR an
+    active systemd-logind session (the usual case under any compositor)
+  - python3-dbus (only when the logind backend is used)
+"""
+
+import glob
+import os
+import signal
+import sys
+import time
+
+# ---------------------------------------------------------------------------
+# Hardware paths (auto-detected at startup)
+# ---------------------------------------------------------------------------
+
+SENSOR_FILE = None          # IIO illuminance node
+BL_BRIGHTNESS_FILE = None   # backlight brightness node
+BL_NAME = None              # backlight device name (e.g. "apple-panel-bl")
+BL_MAX = None               # max_brightness (scale varies per panel)
+
+# ---------------------------------------------------------------------------
+# Tuning constants
+# ---------------------------------------------------------------------------
+
+POLL_INTERVAL = 0.25        # seconds between sensor reads
+SMOOTH_STEP_PCT = 0.5       # brightness change per cycle, % of max
+MIN_BRIGHTNESS_PCT = 2      # floor, % of max (prevents black screen)
+
+# Hysteresis: ignore target moves smaller than this, so sensor jitter near a
+# curve point doesn't make us ramp forever (and never settle / never detect
+# manual changes).
+DEADBAND_PCT = 1.5          # % of max; new target must move at least this much
+
+# Manual override: if the backlight value diverges from what WE last wrote by
+# more than this, someone else changed it (compositor key, brightnessctl, …).
+OVERRIDE_PCT = 1.0          # % of max
+
+LUX_CHANGE_PCT = 75         # % lux change to resume after manual override
+LUX_CHANGE_MIN = 5          # absolute lux change minimum (for dark conditions)
+
+# Derived from BL_MAX at startup
+STEP = None                 # brightness units per cycle
+FLOOR = None                # minimum brightness units
+DEADBAND = None             # minimum target move to act on
+OVERRIDE_THRESHOLD = None   # divergence that counts as a manual change
+
+# Lux → brightness % curve (linearly interpolated)
+LUX_CURVE = [
+    (0,     2),
+    (1,     3),
+    (5,     6),
+    (20,   12),
+    (50,   24),
+    (100,  40),
+    (200,  60),
+    (400,  80),
+    (700,  92),
+    (1000, 100),
+]
+
+# ---------------------------------------------------------------------------
+# Sysfs lux reader
+# ---------------------------------------------------------------------------
+
+def find_sensor():
+    """Auto-detect the IIO ALS sensor path (device number varies across boots)."""
+    for dev in sorted(glob.glob("/sys/bus/iio/devices/iio:device*")):
+        lux_file = os.path.join(dev, "in_illuminance_input")
+        if os.path.exists(lux_file):
+            name = ""
+            try:
+                with open(os.path.join(dev, "name")) as f:
+                    name = f.read().strip()
+            except Exception:
+                pass
+            return lux_file, name
+    return None, None
+
+def read_lux():
+    """Read lux from IIO sensor sysfs (returns int or None)."""
+    try:
+        with open(SENSOR_FILE, "r") as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+# ---------------------------------------------------------------------------
+# Backlight control (sysfs read + pluggable write backend)
+# ---------------------------------------------------------------------------
+
+def find_backlight():
+    """Auto-detect the first usable /sys/class/backlight device."""
+    for bl in sorted(glob.glob("/sys/class/backlight/*")):
+        b = os.path.join(bl, "brightness")
+        m = os.path.join(bl, "max_brightness")
+        if os.path.exists(b) and os.path.exists(m):
+            try:
+                with open(m) as f:
+                    return os.path.basename(bl), b, int(f.read().strip())
+            except Exception:
+                continue
+    return None, None, None
+
+def read_brightness():
+    """Read current brightness from the backlight sysfs node (int or None)."""
+    try:
+        with open(BL_BRIGHTNESS_FILE, "r") as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+def _resolve_logind_session():
+    """Return an org.freedesktop.login1.Session interface for this user's
+    active seat session. Raises on failure."""
+    import dbus  # lazy: only needed for the logind backend
+    bus = dbus.SystemBus()
+    mgr = dbus.Interface(
+        bus.get_object("org.freedesktop.login1", "/org/freedesktop/login1"),
+        "org.freedesktop.login1.Manager",
+    )
+    uid = os.getuid()
+    sid_env = os.environ.get("XDG_SESSION_ID")
+    fallback = None
+    for sid, suid, _user, seat, path in mgr.ListSessions():
+        if int(suid) != uid or not str(seat):
+            continue  # only graphical seat sessions belonging to us
+        sess = bus.get_object("org.freedesktop.login1", path)
+        props = dbus.Interface(sess, "org.freedesktop.DBus.Properties")
+        try:
+            active = bool(props.Get("org.freedesktop.login1.Session", "Active"))
+        except Exception:
+            active = False
+        if not active:
+            continue
+        iface = dbus.Interface(sess, "org.freedesktop.login1.Session")
+        if str(sid) == str(sid_env):
+            return iface
+        if fallback is None:
+            fallback = iface
+    if fallback is not None:
+        return fallback
+    raise RuntimeError("no active logind session for this user")
+
+def make_setter():
+    """Pick a brightness write backend; return (set_fn, label)."""
+    # Backend 1: direct sysfs write (needs a writable node, e.g. udev rule)
+    if os.access(BL_BRIGHTNESS_FILE, os.W_OK):
+        def _set(val):
+            try:
+                with open(BL_BRIGHTNESS_FILE, "w") as f:
+                    f.write(str(val))
+            except Exception:
+                pass
+        return _set, "sysfs direct write"
+
+    # Backend 2: systemd-logind D-Bus (no root, no udev rule)
+    import dbus
+    state = {"iface": _resolve_logind_session()}
+
+    def _set(val):
+        for attempt in (1, 2):
+            try:
+                state["iface"].SetBrightness(
+                    "backlight", BL_NAME, dbus.UInt32(val))
+                return
+            except Exception:
+                if attempt == 1:
+                    try:  # session may have changed (suspend / VT switch)
+                        state["iface"] = _resolve_logind_session()
+                    except Exception:
+                        return
+    return _set, "logind D-Bus"
+
+# ---------------------------------------------------------------------------
+# Lux → brightness mapping
+# ---------------------------------------------------------------------------
+
+def lux_to_brightness(lux):
+    """Map a lux value to backlight units (FLOOR–BL_MAX) via LUX_CURVE."""
+    if lux <= LUX_CURVE[0][0]:
+        pct = LUX_CURVE[0][1]
+    elif lux >= LUX_CURVE[-1][0]:
+        pct = LUX_CURVE[-1][1]
+    else:
+        pct = 50
+        for i in range(len(LUX_CURVE) - 1):
+            l0, b0 = LUX_CURVE[i]
+            l1, b1 = LUX_CURVE[i + 1]
+            if l0 <= lux <= l1:
+                t = (lux - l0) / (l1 - l0)
+                pct = b0 + t * (b1 - b0)
+                break
+    return max(FLOOR, min(BL_MAX, int(round(pct / 100.0 * BL_MAX))))
+
+# ---------------------------------------------------------------------------
+# Manual override detection
+# ---------------------------------------------------------------------------
+
+def lux_changed_enough(current_lux, override_lux):
+    """Check if ambient light has changed enough to resume auto-brightness."""
+    delta = abs(current_lux - override_lux)
+    if delta < LUX_CHANGE_MIN:
+        return False
+    if override_lux == 0:
+        return True
+    return (delta * 100 / override_lux) >= LUX_CHANGE_PCT
+
+# ---------------------------------------------------------------------------
+# Per-cycle decision (pure logic, no I/O — kept separate so it's testable)
+# ---------------------------------------------------------------------------
+
+def step(state, lux, actual):
+    """Advance the controller one cycle.
+
+    `state` is a dict carrying: current, last_set, committed_target,
+    manual_override, override_lux. `lux` is the latest reading; `actual` is
+    the backlight value read back from sysfs (or None).
+
+    Returns the brightness value to write this cycle, or None to write
+    nothing. Sets state["log"] to a message when a transition is worth
+    reporting.
+    """
+    raw_target = lux_to_brightness(lux)
+    last_set = state["last_set"]
+
+    # Manual override detection, every cycle: our own writes land exactly
+    # (readback == last_set), so any divergence is an external change — a
+    # compositor brightness key, brightnessctl, etc. Catches it even mid-ramp.
+    if actual is not None and abs(actual - last_set) > OVERRIDE_THRESHOLD:
+        if not state["manual_override"]:
+            state["log"] = (f"manual override "
+                            f"(ours={last_set}, now={actual})")
+        state["manual_override"] = True
+        state["override_lux"] = lux
+        state["current"] = actual
+        state["last_set"] = actual
+        return None
+
+    # In manual override: hold until ambient light shifts significantly.
+    if state["manual_override"]:
+        if lux_changed_enough(lux, state["override_lux"]):
+            state["manual_override"] = False
+            state["committed_target"] = raw_target
+            state["log"] = f"resuming (lux {state['override_lux']}->{lux})"
+            # fall through and start ramping toward the new target
+        else:
+            return None
+
+    # Hysteresis: only adopt a new target once it has moved beyond the
+    # deadband. Small sensor jitter leaves committed_target untouched, so we
+    # actually settle (no perpetual ramping, no needless writes/notifications).
+    if abs(raw_target - state["committed_target"]) >= DEADBAND:
+        state["committed_target"] = raw_target
+
+    ct = state["committed_target"]
+    cur = state["current"]
+    if cur == ct:
+        return None  # settled
+
+    if cur < ct:
+        cur = min(cur + STEP, ct)
+    else:
+        cur = max(cur - STEP, ct)
+    state["current"] = cur
+    state["last_set"] = cur
+    return cur
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def main():
+    global SENSOR_FILE, BL_BRIGHTNESS_FILE, BL_NAME, BL_MAX
+    global STEP, FLOOR, DEADBAND, OVERRIDE_THRESHOLD
+
+    sensor_path, sensor_name = find_sensor()
+    if sensor_path is None:
+        print("auto-brightness: no IIO illuminance sensor found", flush=True)
+        sys.exit(1)
+    SENSOR_FILE = sensor_path
+
+    BL_NAME, BL_BRIGHTNESS_FILE, BL_MAX = find_backlight()
+    if BL_NAME is None:
+        print("auto-brightness: no /sys/class/backlight device found", flush=True)
+        sys.exit(1)
+    STEP = max(1, round(BL_MAX * SMOOTH_STEP_PCT / 100.0))
+    FLOOR = max(1, round(BL_MAX * MIN_BRIGHTNESS_PCT / 100.0))
+    DEADBAND = max(2 * STEP, round(BL_MAX * DEADBAND_PCT / 100.0))
+    OVERRIDE_THRESHOLD = max(2 * STEP, round(BL_MAX * OVERRIDE_PCT / 100.0))
+
+    print(f"auto-brightness: sensor '{sensor_name}' at {sensor_path}", flush=True)
+
+    try:
+        set_brightness, backend = make_setter()
+    except Exception as e:
+        print(f"auto-brightness: no brightness backend available ({e})", flush=True)
+        sys.exit(1)
+
+    current = read_brightness()
+    if current is None:
+        print("auto-brightness: cannot read backlight brightness, exiting", flush=True)
+        sys.exit(1)
+
+    print(f"auto-brightness: backlight '{BL_NAME}' via {backend}, "
+          f"max={BL_MAX}, step={STEP}, floor={FLOOR}, deadband={DEADBAND}, "
+          f"override>{OVERRIDE_THRESHOLD}, poll={POLL_INTERVAL}s, "
+          f"initial={current}/{BL_MAX}", flush=True)
+
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+
+    state = {
+        "current": current,
+        "last_set": current,        # what WE last wrote
+        "committed_target": current,  # target after hysteresis
+        "manual_override": False,
+        "override_lux": 0,
+        "log": None,
+    }
+
+    while True:
+        time.sleep(POLL_INTERVAL)
+
+        lux = read_lux()
+        if lux is None:
+            continue
+
+        actual = read_brightness()
+        val = step(state, lux, actual)
+
+        if state["log"]:
+            print(f"auto-brightness: {state['log']}", flush=True)
+            state["log"] = None
+        if val is not None:
+            set_brightness(val)
+
+
+if __name__ == "__main__":
+    main()
